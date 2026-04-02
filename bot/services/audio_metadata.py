@@ -168,6 +168,14 @@ class AudioMetadataService:
         if last_error is not None:
             raise self._map_processing_error(last_error, detected.format_name) from last_error
 
+        logger.info(
+            "Audio metadata processed: input=%s detected_family=%s detected_format=%s output=%s",
+            str(audio_path),
+            detected.family,
+            detected.format_name,
+            str(output_path),
+        )
+
         return ProcessedAudio(
             path=output_path,
             download_name=self.build_download_name(desired_name, detected.extension),
@@ -332,7 +340,7 @@ class AudioMetadataService:
         if family == "ogg":
             return original_extension if original_extension in self.OGG_EXTENSIONS else ".ogg"
         if family == "matroska":
-            return original_extension if original_extension in self.MATROSKA_EXTENSIONS else ".webm"
+            return ".mp3"
         return original_extension or ".bin"
 
     def _write_with_ffmpeg(
@@ -350,7 +358,6 @@ class AudioMetadataService:
             raise UnsupportedFormatError("ffmpeg topilmadi.")
 
         if detected.family == "matroska":
-            attachment_extension = ".png" if cover.mime == "image/png" else ".jpg"
             command = [
                 self.ffmpeg_path,
                 "-y",
@@ -358,22 +365,30 @@ class AudioMetadataService:
                 "error",
                 "-i",
                 str(audio_path),
+                "-i",
+                str(image_path),
                 "-map",
                 "0:a:0",
+                "-map",
+                "1:v:0",
                 "-map_metadata",
                 "0",
                 "-c:a",
-                "copy",
+                "libmp3lame",
+                "-q:a",
+                "2",
+                "-c:v",
+                "mjpeg",
+                "-id3v2_version",
+                "3",
                 "-metadata",
                 f"title={desired_name}",
                 "-metadata",
                 f"artist={desired_artist}",
-                "-attach",
-                str(image_path),
-                "-metadata:s:t",
-                f"mimetype={cover.mime}",
-                "-metadata:s:t",
-                f"filename=cover{attachment_extension}",
+                "-metadata:s:v",
+                "title=Album cover",
+                "-metadata:s:v",
+                "comment=Cover (front)",
                 str(output_path),
             ]
             try:

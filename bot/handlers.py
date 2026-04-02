@@ -261,6 +261,7 @@ async def _handle_audio_message(
         mime_type=source.mime_type,
     )
     processed_audio = None
+    should_cleanup_session = False
     try:
         await file_storage.download(message.bot, telegram_file=source.telegram_file, destination=audio_path)
         await session_repository.save_audio(message.from_user.id, str(audio_path))
@@ -291,31 +292,45 @@ async def _handle_audio_message(
             )
 
         await message.answer("Jarayon yakunlandi. Vaqtinchalik fayllar va DB yozuvi o'chirildi.")
+        should_cleanup_session = True
     except UnsupportedFormatError as error:
         logger.warning(
             "Audio formatini yangilab bo'lmadi: user_id=%s error=%s",
             message.from_user.id,
             str(error),
         )
-        await message.answer(
-            f"Audio formatini yangilab bo'lmadi: {error}\n"
-            "Jarayon tozalandi. Iltimos, rasm yuborib qaytadan boshlang."
-        )
-    except Exception:
-        logger.exception("Audio qayta ishlashda xatolik yuz berdi", extra={"user_id": message.from_user.id})
-        await message.answer(
-            "Audio faylni tayyorlashda xatolik yuz berdi. Jarayon tozalandi, iltimos qaytadan urinib ko'ring."
-        )
-    finally:
-        extra_paths: list[Path] = [audio_path]
-        if processed_audio is not None:
-            extra_paths.append(processed_audio.path)
-        await _cleanup_session(
+        await _reset_after_audio_failure(
             user_id=message.from_user.id,
             session_repository=session_repository,
             file_storage=file_storage,
-            extra_paths=extra_paths,
+            extra_paths=[audio_path, processed_audio.path] if processed_audio is not None else [audio_path],
         )
+        await message.answer(
+            f"Audio formatini yangilab bo'lmadi: {error}\n"
+            "Nom, artist va rasm saqlandi. Iltimos, boshqa audio yuborib ko'ring."
+        )
+    except Exception:
+        logger.exception("Audio qayta ishlashda xatolik yuz berdi", extra={"user_id": message.from_user.id})
+        await _reset_after_audio_failure(
+            user_id=message.from_user.id,
+            session_repository=session_repository,
+            file_storage=file_storage,
+            extra_paths=[audio_path, processed_audio.path] if processed_audio is not None else [audio_path],
+        )
+        await message.answer(
+            "Audio faylni tayyorlashda xatolik yuz berdi. Nom, artist va rasm saqlandi. Iltimos, audioni qayta yuboring."
+        )
+    finally:
+        if should_cleanup_session:
+            extra_paths: list[Path] = [audio_path]
+            if processed_audio is not None:
+                extra_paths.append(processed_audio.path)
+            await _cleanup_session(
+                user_id=message.from_user.id,
+                session_repository=session_repository,
+                file_storage=file_storage,
+                extra_paths=extra_paths,
+            )
 
 
 async def _cleanup_session(
@@ -336,6 +351,17 @@ async def _cleanup_session(
 
     file_storage.cleanup_paths(*cleanup_targets)
     await session_repository.delete_session(user_id)
+
+
+async def _reset_after_audio_failure(
+    *,
+    user_id: int,
+    session_repository: SessionRepository,
+    file_storage: FileStorage,
+    extra_paths: list[Path] | None = None,
+) -> None:
+    file_storage.cleanup_paths(*(extra_paths or []))
+    await session_repository.reset_to_awaiting_audio(user_id)
 
 
 def _prompt_for_step(step: str) -> str:

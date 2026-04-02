@@ -149,6 +149,23 @@ class SessionRepository:
             raise RuntimeError("Audio saqlashdan oldin sessiya mavjud emas.")
         return self._row_to_session(record)
 
+    async def reset_to_awaiting_audio(self, user_id: int) -> UserSession | None:
+        pool = self._ensure_pool()
+        record = await pool.fetchrow(
+            """
+            UPDATE user_sessions
+            SET step = 'awaiting_audio',
+                audio_path = NULL,
+                updated_at = NOW()
+            WHERE user_id = $1
+            RETURNING user_id, step, image_path, audio_path, desired_name, desired_artist
+            """,
+            user_id,
+        )
+        if record is None:
+            return None
+        return self._row_to_session(record)
+
     async def delete_session(self, user_id: int) -> None:
         pool = self._ensure_pool()
         await pool.execute(
