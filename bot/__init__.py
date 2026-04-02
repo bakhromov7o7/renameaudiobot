@@ -1,0 +1,2 @@
+"""Rename audio bot package."""
+

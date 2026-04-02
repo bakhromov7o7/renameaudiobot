@@ -1,0 +1,6 @@
+aiogram==3.22.0
+asyncpg==0.30.0
+mutagen==1.47.0
+Pillow==11.1.0
+python-dotenv==1.1.1
+
