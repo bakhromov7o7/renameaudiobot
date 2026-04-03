@@ -14,3 +14,14 @@ class UserSession:
     audio_path: str | None
     desired_name: str | None
     desired_artist: str | None
+
+
+@dataclass
+class UsageUserSummary:
+    user_id: int
+    username: str | None
+    full_name: str | None
+    rename_count: int
+    last_source_name: str | None
+    last_target_name: str | None
+    last_target_artist: str | None

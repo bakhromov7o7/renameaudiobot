@@ -3,13 +3,13 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from aiogram import Router
+from aiogram import Bot, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Document, FSInputFile, Message
 
 from bot.config import Settings
 from bot.database import SessionRepository
-from bot.models import UserSession
+from bot.models import UsageUserSummary, UserSession
 from bot.services.audio_metadata import AudioMetadataService, CoverImageError, UnsupportedFormatError
 from bot.services.storage import FileStorage
 
@@ -32,7 +32,11 @@ def create_router(
         if message.from_user is None:
             return
 
-        await session_repository.track_user(message.from_user.id)
+        await session_repository.track_user(
+            message.from_user.id,
+            username=message.from_user.username,
+            full_name=message.from_user.full_name,
+        )
         await _cleanup_session(
             user_id=message.from_user.id,
             session_repository=session_repository,
@@ -45,13 +49,22 @@ def create_router(
             "3. Ijrochi nomini yuboring.\n"
             "4. Audio yuboring."
         )
+        logger.info("Start bosildi: %s", _format_user_tag(message))
+        await _notify_superadmin(
+            message.bot,
+            f"Start bosildi.\n{_format_user_tag(message)}",
+        )
 
     @router.message(Command("cancel"))
     async def cancel_command(message: Message) -> None:
         if message.from_user is None:
             return
 
-        await session_repository.track_user(message.from_user.id)
+        await session_repository.track_user(
+            message.from_user.id,
+            username=message.from_user.username,
+            full_name=message.from_user.full_name,
+        )
         await _cleanup_session(
             user_id=message.from_user.id,
             session_repository=session_repository,
@@ -64,17 +77,25 @@ def create_router(
         if message.from_user is None:
             return
 
-        await session_repository.track_user(message.from_user.id)
+        await session_repository.track_user(
+            message.from_user.id,
+            username=message.from_user.username,
+            full_name=message.from_user.full_name,
+        )
 
         if not _is_superadmin(message):
             await message.answer("Bu buyruq faqat superadmin uchun.")
             return
 
         total_users, total_renames = await session_repository.get_usage_stats()
-        await message.answer(
-            "Superadmin statistika:\n"
-            f"Foydalanuvchilar soni: {total_users}\n"
-            f"Rename qilingan audio soni: {total_renames}"
+        users = await session_repository.list_usage_users()
+        await _answer_in_chunks(
+            message,
+            _build_superadmin_report(
+                total_users=total_users,
+                total_renames=total_renames,
+                users=users,
+            ),
         )
 
     @router.message()
@@ -83,7 +104,11 @@ def create_router(
             return
 
         user_id = message.from_user.id
-        await session_repository.track_user(user_id)
+        await session_repository.track_user(
+            user_id,
+            username=message.from_user.username,
+            full_name=message.from_user.full_name,
+        )
 
         if message.text and message.text.startswith("/"):
             await message.answer("Noma'lum buyruq. Yangi jarayon uchun /start yoki bekor qilish uchun /cancel yuboring.")
@@ -286,6 +311,7 @@ async def _handle_audio_message(
     )
     processed_audio = None
     should_cleanup_session = False
+    source_name = _describe_audio_source(message, source)
     try:
         await file_storage.download(message.bot, telegram_file=source.telegram_file, destination=audio_path)
         await session_repository.save_audio(message.from_user.id, str(audio_path))
@@ -315,7 +341,27 @@ async def _handle_audio_message(
                 caption="Tayyor audio fayl.",
             )
 
-        await session_repository.increment_audio_rename_count()
+        await session_repository.record_audio_rename(
+            user_id=message.from_user.id,
+            desired_name=session.desired_name,
+            desired_artist=session.desired_artist,
+            source_name=source_name,
+        )
+        logger.info(
+            "Audio rename qilindi: user_id=%s source=%s target=%s artist=%s",
+            message.from_user.id,
+            source_name,
+            session.desired_name,
+            session.desired_artist,
+        )
+        await _notify_superadmin(
+            message.bot,
+            "Audio rename qilindi.\n"
+            f"{_format_user_tag(message)}\n"
+            f"Eski nom: {source_name}\n"
+            f"Yangi nom: {session.desired_name}\n"
+            f"Artist: {session.desired_artist}",
+        )
         await message.answer("Jarayon yakunlandi. Vaqtinchalik fayllar va DB yozuvi o'chirildi.")
         should_cleanup_session = True
     except UnsupportedFormatError as error:
@@ -438,6 +484,111 @@ def _is_audio_document(document: Document) -> bool:
     mime_type = (document.mime_type or "").lower()
     suffix = Path(document.file_name or "").suffix.lower()
     return mime_type.startswith("audio/") or suffix in {".mp3", ".m4a", ".mp4", ".flac", ".wav", ".ogg", ".opus", ".oga", ".webm", ".mka", ".mkv"}
+
+
+async def _notify_superadmin(bot: Bot, text: str) -> None:
+    try:
+        await bot.send_message(SUPERADMIN_ID, text)
+    except Exception:
+        logger.exception("Superadmin log xabarini yuborib bo'lmadi")
+
+
+async def _answer_in_chunks(message: Message, text: str, chunk_size: int = 3500) -> None:
+    for chunk in _chunk_text(text, chunk_size):
+        await message.answer(chunk)
+
+
+def _chunk_text(text: str, chunk_size: int) -> list[str]:
+    if len(text) <= chunk_size:
+        return [text]
+
+    chunks: list[str] = []
+    current = ""
+    for line in text.splitlines(keepends=True):
+        if len(current) + len(line) > chunk_size and current:
+            chunks.append(current.rstrip())
+            current = line
+        else:
+            current += line
+
+    if current:
+        chunks.append(current.rstrip())
+    return chunks
+
+
+def _build_superadmin_report(
+    *,
+    total_users: int,
+    total_renames: int,
+    users: list[UsageUserSummary],
+) -> str:
+    lines = [
+        "Superadmin statistika:",
+        f"Foydalanuvchilar soni: {total_users}",
+        f"Rename qilingan audio soni: {total_renames}",
+        "",
+        "Foydalanuvchilar ro'yxati:",
+    ]
+
+    if not users:
+        lines.append("Hali foydalanuvchi yo'q.")
+        return "\n".join(lines)
+
+    for index, user in enumerate(users, start=1):
+        identity = _format_user_identity(user.full_name, user.username, user.user_id)
+        latest = _format_latest_rename(user)
+        lines.append(
+            f"{index}. {identity} | rename: {user.rename_count} | oxirgisi: {latest}"
+        )
+
+    return "\n".join(lines)
+
+
+def _format_latest_rename(user: UsageUserSummary) -> str:
+    if not user.last_target_name:
+        return "hali rename qilmagan"
+
+    target = user.last_target_name
+    if user.last_target_artist:
+        target = f"{target} - {user.last_target_artist}"
+
+    if user.last_source_name:
+        return f"{user.last_source_name} -> {target}"
+    return target
+
+
+def _format_user_tag(message: Message) -> str:
+    if message.from_user is None:
+        return "Foydalanuvchi aniqlanmadi."
+    return _format_user_identity(
+        message.from_user.full_name,
+        message.from_user.username,
+        message.from_user.id,
+    )
+
+
+def _format_user_identity(full_name: str | None, username: str | None, user_id: int) -> str:
+    parts = [full_name or "Nomsiz foydalanuvchi"]
+    if username:
+        parts.append(f"@{username}")
+    parts.append(f"ID: {user_id}")
+    return " | ".join(parts)
+
+
+def _describe_audio_source(message: Message, source: "_IncomingFile") -> str:
+    if message.audio:
+        title_parts = [message.audio.performer, message.audio.title]
+        rich_title = " - ".join(part.strip() for part in title_parts if part and part.strip())
+        if rich_title:
+            return rich_title
+
+    if source.file_name:
+        return source.file_name
+
+    if message.voice:
+        return "voice message"
+
+    return "nomi noma'lum audio"
 
 
 class _IncomingFile:

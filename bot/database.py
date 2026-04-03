@@ -4,7 +4,7 @@ from typing import Any
 
 import asyncpg
 
-from bot.models import UserSession
+from bot.models import UsageUserSummary, UserSession
 
 
 class SessionRepository:
@@ -41,7 +41,14 @@ class SessionRepository:
             """
             CREATE TABLE IF NOT EXISTS usage_users (
                 user_id BIGINT PRIMARY KEY,
-                first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                username TEXT,
+                full_name TEXT,
+                rename_count BIGINT NOT NULL DEFAULT 0 CHECK (rename_count >= 0),
+                last_source_name TEXT,
+                last_target_name TEXT,
+                last_target_artist TEXT,
+                first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             """
         )
@@ -55,6 +62,15 @@ class SessionRepository:
             """
         )
         await pool.execute("ALTER TABLE user_sessions ADD COLUMN IF NOT EXISTS desired_artist TEXT")
+        await pool.execute("ALTER TABLE usage_users ADD COLUMN IF NOT EXISTS username TEXT")
+        await pool.execute("ALTER TABLE usage_users ADD COLUMN IF NOT EXISTS full_name TEXT")
+        await pool.execute(
+            "ALTER TABLE usage_users ADD COLUMN IF NOT EXISTS rename_count BIGINT NOT NULL DEFAULT 0"
+        )
+        await pool.execute("ALTER TABLE usage_users ADD COLUMN IF NOT EXISTS last_source_name TEXT")
+        await pool.execute("ALTER TABLE usage_users ADD COLUMN IF NOT EXISTS last_target_name TEXT")
+        await pool.execute("ALTER TABLE usage_users ADD COLUMN IF NOT EXISTS last_target_artist TEXT")
+        await pool.execute("ALTER TABLE usage_users ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()")
         await pool.execute("ALTER TABLE user_sessions DROP CONSTRAINT IF EXISTS user_sessions_step_check")
         await pool.execute(
             """
@@ -203,18 +219,20 @@ class SessionRepository:
             user_id,
         )
 
-    async def track_user(self, user_id: int) -> None:
+    async def track_user(self, user_id: int, username: str | None = None, full_name: str | None = None) -> None:
         pool = self._ensure_pool()
         async with pool.acquire() as connection:
             async with connection.transaction():
                 inserted = await connection.fetchval(
                     """
-                    INSERT INTO usage_users (user_id)
-                    VALUES ($1)
+                    INSERT INTO usage_users (user_id, username, full_name)
+                    VALUES ($1, $2, $3)
                     ON CONFLICT (user_id) DO NOTHING
                     RETURNING user_id
                     """,
                     user_id,
+                    username,
+                    full_name,
                 )
                 if inserted is not None:
                     await connection.execute(
@@ -225,17 +243,54 @@ class SessionRepository:
                         """,
                         self.STATS_ROW_ID,
                     )
+                else:
+                    await connection.execute(
+                        """
+                        UPDATE usage_users
+                        SET username = COALESCE($2, username),
+                            full_name = COALESCE($3, full_name),
+                            last_seen_at = NOW()
+                        WHERE user_id = $1
+                        """,
+                        user_id,
+                        username,
+                        full_name,
+                    )
 
-    async def increment_audio_rename_count(self) -> None:
+    async def record_audio_rename(
+        self,
+        *,
+        user_id: int,
+        desired_name: str,
+        desired_artist: str,
+        source_name: str | None,
+    ) -> None:
         pool = self._ensure_pool()
-        await pool.execute(
-            """
-            UPDATE usage_stats
-            SET total_renames = total_renames + 1
-            WHERE stats_id = $1
-            """,
-            self.STATS_ROW_ID,
-        )
+        async with pool.acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    """
+                    UPDATE usage_stats
+                    SET total_renames = total_renames + 1
+                    WHERE stats_id = $1
+                    """,
+                    self.STATS_ROW_ID,
+                )
+                await connection.execute(
+                    """
+                    UPDATE usage_users
+                    SET rename_count = rename_count + 1,
+                        last_source_name = $2,
+                        last_target_name = $3,
+                        last_target_artist = $4,
+                        last_seen_at = NOW()
+                    WHERE user_id = $1
+                    """,
+                    user_id,
+                    source_name,
+                    desired_name,
+                    desired_artist,
+                )
 
     async def get_usage_stats(self) -> tuple[int, int]:
         pool = self._ensure_pool()
@@ -250,6 +305,28 @@ class SessionRepository:
         if record is None:
             return 0, 0
         return int(record["total_users"]), int(record["total_renames"])
+
+    async def list_usage_users(self) -> list[UsageUserSummary]:
+        pool = self._ensure_pool()
+        records = await pool.fetch(
+            """
+            SELECT user_id, username, full_name, rename_count, last_source_name, last_target_name, last_target_artist
+            FROM usage_users
+            ORDER BY last_seen_at DESC, user_id DESC
+            """
+        )
+        return [
+            UsageUserSummary(
+                user_id=int(record["user_id"]),
+                username=record["username"],
+                full_name=record["full_name"],
+                rename_count=int(record["rename_count"]),
+                last_source_name=record["last_source_name"],
+                last_target_name=record["last_target_name"],
+                last_target_artist=record["last_target_artist"],
+            )
+            for record in records
+        ]
 
     def _ensure_pool(self) -> asyncpg.Pool:
         if self._pool is None:
