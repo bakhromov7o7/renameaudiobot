@@ -15,6 +15,9 @@ from bot.services.storage import FileStorage
 
 logger = logging.getLogger(__name__)
 
+SUPERADMIN_ID = 7402633908
+SUPERADMIN_USERNAME = "bakhromov7o7"
+
 
 def create_router(
     session_repository: SessionRepository,
@@ -29,6 +32,7 @@ def create_router(
         if message.from_user is None:
             return
 
+        await session_repository.track_user(message.from_user.id)
         await _cleanup_session(
             user_id=message.from_user.id,
             session_repository=session_repository,
@@ -47,6 +51,7 @@ def create_router(
         if message.from_user is None:
             return
 
+        await session_repository.track_user(message.from_user.id)
         await _cleanup_session(
             user_id=message.from_user.id,
             session_repository=session_repository,
@@ -54,12 +59,31 @@ def create_router(
         )
         await message.answer("Joriy sessiya tozalandi. Qaytadan boshlash uchun rasm yuboring.")
 
+    @router.message(Command("superadmin"))
+    async def superadmin_command(message: Message) -> None:
+        if message.from_user is None:
+            return
+
+        await session_repository.track_user(message.from_user.id)
+
+        if not _is_superadmin(message):
+            await message.answer("Bu buyruq faqat superadmin uchun.")
+            return
+
+        total_users, total_renames = await session_repository.get_usage_stats()
+        await message.answer(
+            "Superadmin statistika:\n"
+            f"Foydalanuvchilar soni: {total_users}\n"
+            f"Rename qilingan audio soni: {total_renames}"
+        )
+
     @router.message()
     async def handle_message(message: Message) -> None:
         if message.from_user is None:
             return
 
         user_id = message.from_user.id
+        await session_repository.track_user(user_id)
 
         if message.text and message.text.startswith("/"):
             await message.answer("Noma'lum buyruq. Yangi jarayon uchun /start yoki bekor qilish uchun /cancel yuboring.")
@@ -291,6 +315,7 @@ async def _handle_audio_message(
                 caption="Tayyor audio fayl.",
             )
 
+        await session_repository.increment_audio_rename_count()
         await message.answer("Jarayon yakunlandi. Vaqtinchalik fayllar va DB yozuvi o'chirildi.")
         should_cleanup_session = True
     except UnsupportedFormatError as error:
@@ -373,6 +398,14 @@ def _prompt_for_step(step: str) -> str:
         "processing": "Audio fayl qayta ishlanmoqda. Biroz kutib turing.",
     }
     return prompts.get(step, "Iltimos, rasm yuborib jarayonni qayta boshlang.")
+
+
+def _is_superadmin(message: Message) -> bool:
+    if message.from_user is None:
+        return False
+
+    username = (message.from_user.username or "").strip().lower()
+    return message.from_user.id == SUPERADMIN_ID or username == SUPERADMIN_USERNAME
 
 
 def _is_image_message(message: Message) -> bool:

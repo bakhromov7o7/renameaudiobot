@@ -8,6 +8,8 @@ from bot.models import UserSession
 
 
 class SessionRepository:
+    STATS_ROW_ID = 1
+
     def __init__(self, database_url: str) -> None:
         self._database_url = database_url
         self._pool: asyncpg.Pool | None = None
@@ -35,6 +37,23 @@ class SessionRepository:
             );
             """
         )
+        await pool.execute(
+            """
+            CREATE TABLE IF NOT EXISTS usage_users (
+                user_id BIGINT PRIMARY KEY,
+                first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+        await pool.execute(
+            """
+            CREATE TABLE IF NOT EXISTS usage_stats (
+                stats_id SMALLINT PRIMARY KEY,
+                total_users BIGINT NOT NULL DEFAULT 0 CHECK (total_users >= 0),
+                total_renames BIGINT NOT NULL DEFAULT 0 CHECK (total_renames >= 0)
+            );
+            """
+        )
         await pool.execute("ALTER TABLE user_sessions ADD COLUMN IF NOT EXISTS desired_artist TEXT")
         await pool.execute("ALTER TABLE user_sessions DROP CONSTRAINT IF EXISTS user_sessions_step_check")
         await pool.execute(
@@ -43,6 +62,14 @@ class SessionRepository:
             ADD CONSTRAINT user_sessions_step_check
             CHECK (step IN ('awaiting_image', 'awaiting_name', 'awaiting_artist', 'awaiting_audio', 'processing'))
             """
+        )
+        await pool.execute(
+            """
+            INSERT INTO usage_stats (stats_id, total_users, total_renames)
+            VALUES ($1, 0, 0)
+            ON CONFLICT (stats_id) DO NOTHING
+            """,
+            self.STATS_ROW_ID,
         )
 
     async def get_session(self, user_id: int) -> UserSession | None:
@@ -175,6 +202,54 @@ class SessionRepository:
             """,
             user_id,
         )
+
+    async def track_user(self, user_id: int) -> None:
+        pool = self._ensure_pool()
+        async with pool.acquire() as connection:
+            async with connection.transaction():
+                inserted = await connection.fetchval(
+                    """
+                    INSERT INTO usage_users (user_id)
+                    VALUES ($1)
+                    ON CONFLICT (user_id) DO NOTHING
+                    RETURNING user_id
+                    """,
+                    user_id,
+                )
+                if inserted is not None:
+                    await connection.execute(
+                        """
+                        UPDATE usage_stats
+                        SET total_users = total_users + 1
+                        WHERE stats_id = $1
+                        """,
+                        self.STATS_ROW_ID,
+                    )
+
+    async def increment_audio_rename_count(self) -> None:
+        pool = self._ensure_pool()
+        await pool.execute(
+            """
+            UPDATE usage_stats
+            SET total_renames = total_renames + 1
+            WHERE stats_id = $1
+            """,
+            self.STATS_ROW_ID,
+        )
+
+    async def get_usage_stats(self) -> tuple[int, int]:
+        pool = self._ensure_pool()
+        record = await pool.fetchrow(
+            """
+            SELECT total_users, total_renames
+            FROM usage_stats
+            WHERE stats_id = $1
+            """,
+            self.STATS_ROW_ID,
+        )
+        if record is None:
+            return 0, 0
+        return int(record["total_users"]), int(record["total_renames"])
 
     def _ensure_pool(self) -> asyncpg.Pool:
         if self._pool is None:
